@@ -71,6 +71,7 @@ def test_remove_closes_only_matching_owner_tickets(removal_data, domains, closed
     """Leave another owner's matching hostnames and closed tickets unchanged."""
     db, request, tickets = removal_data
     before = {key: copy.deepcopy(dict(ticket)) for key, ticket in tickets.items()}
+    original_hostnames = list(request["hostnames"])
     timestamp = datetime(2026, 9, 10, 12, 0)
 
     with mock.patch.object(cyhy_domain.util, "utcnow", return_value=timestamp):
@@ -90,9 +91,7 @@ def test_remove_closes_only_matching_owner_tickets(removal_data, domains, closed
             assert not ticket.save.called
             assert not ticket.add_event.called
     assert request["hostnames"] == [
-        hostname for hostname in before["target"].get("unused", [
-            "shared.example.org", "second.example.org", "retained.example.org"
-        ]) if hostname not in domains
+        hostname for hostname in original_hostnames if hostname not in domains
     ]
     request.save.assert_called_once_with()
 
