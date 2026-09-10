@@ -1,0 +1,73 @@
+name: Validate domain ticket owner isolation
+on:
+  push:
+    branches: [validation/domain-ticket-owner]
+permissions:
+  contents: write
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Prepare clean candidate
+        run: |
+          cp cyhy/test/test_domain_ticket_owner.py "$RUNNER_TEMP/domain-ticket-test.py"
+          git switch -c fix/domain-ticket-owner fe65dfc5f8198cf13e7cba226ae9f302d311d8dc
+          cp "$RUNNER_TEMP/domain-ticket-test.py" cyhy/test/test_domain_ticket_owner.py
+          python -m pip install 'black==21.12b0' 'click==8.0.4'
+          python -m black --target-version py27 cyhy/test/test_domain_ticket_owner.py
+      - name: Start isolated test services
+        run: |
+          docker network create cyhy-ticket-regression
+          docker run -d --name cyhy-ticket-mongo --network cyhy-ticket-regression mongo:3.6
+          docker run -d --name cyhy-ticket-tests --network cyhy-ticket-regression -v "$PWD:/src" -w /src -e CYHY_TEST_SKIP_COMPOSE=1 -e CYHY_TEST_DB_URI=mongodb://cyhy-ticket-mongo:27017/test-cyhy -e PYTHONPATH=/src python:2.7.18 sleep infinity
+          docker exec cyhy-ticket-tests pip install -r requirements-test.txt > "$RUNNER_TEMP/install.log" 2>&1 || { tail -100 "$RUNNER_TEMP/install.log"; exit 1; }
+          timeout 60 bash -c 'until docker exec cyhy-ticket-mongo mongo --quiet --eval "db.adminCommand({ping:1})"; do sleep 2; done'
+      - name: Reproduce foreign-owner ticket closure
+        run: |
+          set +e
+          docker exec cyhy-ticket-tests pytest -q cyhy/test/test_domain_ticket_owner.py > "$RUNNER_TEMP/before.log" 2>&1
+          result=$?
+          set -e
+          cat "$RUNNER_TEMP/before.log"
+          test "$result" -eq 1
+          grep -q '2 failed, 1 passed' "$RUNNER_TEMP/before.log"
+      - name: Apply owner constraint
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('bin/cyhy-domain')
+          source = path.read_text()
+          old = '    for t in db.TicketDoc.find({"hostname": {"$in": domains}, "open": True}):'
+          new = '''    for t in db.TicketDoc.find(
+                  {"owner": owner, "hostname": {"$in": domains}, "open": True}
+              ):'''
+          assert source.count(old) == 1
+          path.write_text(source.replace(old, new, 1))
+          PY
+      - name: Run focused and full suites
+        run: |
+          docker exec cyhy-ticket-tests pytest -q cyhy/test/test_domain_ticket_owner.py
+          docker exec cyhy-ticket-tests pytest -q --disable-warnings
+          docker exec cyhy-ticket-tests python -m py_compile bin/cyhy-domain cyhy/test/test_domain_ticket_owner.py
+          python -m black --target-version py27 --check cyhy/test/test_domain_ticket_owner.py
+          git diff --check
+      - name: Publish clean tested branch
+        run: |
+          git add bin/cyhy-domain cyhy/test/test_domain_ticket_owner.py
+          git config user.name 'Sylvester Kaczmarek'
+          git config user.email '16242628+sylvesterkaczmarek@users.noreply.github.com'
+          git commit -s -m 'Scope removed-domain ticket closure to the selected owner'
+          git push origin HEAD:refs/heads/fix/domain-ticket-owner
+          git log -1 --format='%H %s'
+      - name: Stop isolated test services
+        if: always()
+        run: |
+          docker rm -f cyhy-ticket-tests cyhy-ticket-mongo 2>/dev/null || true
+          docker network rm cyhy-ticket-regression 2>/dev/null || true
